@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+مراقبة الأوردر بوك لـ 10 عملات قوية على بينانس (Spot) مع حساب قوة الشراء/البيع
+داخل نافذة نسبة مئوية حول السعر الحالي، وعرض النتائج في جدول حي ملوّن.
+
+المزايا:
+- يجلب عمق السوق (order book depth) حتى 500 مستوى لكل رمز.
+- يحسب إجمالي أحجام العروض (asks) والطلبات (bids) داخل نافذة +/- نسبة مئوية من سعر المنتصف.
+- يخرج نسبة Buy% و Sell% و Imbalance و Spread بالـ bps.
+- جدول حي باستخدام مكتبة Rich مع ألوان جميلة.
+- يطلب API Key و Secret في البداية (اختياري، لأن بيانات العمق عامة، لكنه جاهز للتوسّع لاحقًا).
+
+طريقة التشغيل:
+1) ثبّت المتطلبات:
+   pip install aiohttp rich
+
+2) شغّل السكربت:
+   python orderflow_monitor.py
+
+3) عند التشغيل سيطلب:
+   - Binance API Key
+   - Binance API Secret
+   - نسبة النافذة حول السعر (مثلاً 0.5 يعني ±0.5%)
+   - فترة التحديث بالثواني (افتراضي 3 ثوان)
+
+ملاحظة: هذا السكربت يستخدم واجهة REST العامة لبينانس بدون توقيع،
+ولا يرسل مفاتيحك إلا إذا أضفت لاحقًا نهايات خاصة بالحساب.
+"""
+
+import asyncio
+import math
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import aiohttp
+from rich.live import Live
+from rich.table import Table
+from rich.console import Console
+from rich import box
+
+BINANCE_BASE = "https://api.binance.com"
+
+# الرموز الافتراضية: عدّل القائمة كما تحب
+DEFAULT_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "DOGEUSDT",
+    "XRPUSDT",
+    "ADAUSDT",
+    "TONUSDT",
+    "TRXUSDT",
+    "DOTUSDT",
+]
+
+console = Console()
+
+@dataclass
+class PairStats:
+    symbol: str
+    mid_price: float
+    spread_bps: float
+    bids_vol: float
+    asks_vol: float
+    buy_pct: float
+    sell_pct: float
+    imbalance: float  # (bids-asks)/(bids+asks)
+    last_update: float
+
+
+def human(n: float) -> str:
+    """تنسيق مختصر للأرقام الكبيرة."""
+    if math.isnan(n) or math.isinf(n):
+        return "-"
+    absn = abs(n)
+    if absn >= 1_000_000_000:
+        return f"{n/1_000_000_000:.2f}B"
+    if absn >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if absn >= 1_000:
+        return f"{n/1_000:.2f}K"
+    return f"{n:.2f}"
+
+
+async def fetch_depth(session: aiohttp.ClientSession, symbol: str, limit: int = 500) -> Dict:
+    url = f"{BINANCE_BASE}/api/v3/depth"
+    params = {"symbol": symbol, "limit": str(limit)}
+    async with session.get(url, params=params, timeout=10) as r:
+        r.raise_for_status()
+        return await r.json()
+
+
+def calc_stats(symbol: str, depth: Dict, pct_window: float) -> PairStats:
+    bids = depth.get("bids", [])
+    asks = depth.get("asks", [])
+    if not bids or not asks:
+        return PairStats(symbol, float("nan"), float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, time.time())
+
+    best_bid = float(bids[0][0])
+    best_ask = float(asks[0][0])
+    mid = (best_bid + best_ask) / 2.0
+    spread_bps = ((best_ask - best_bid) / mid) * 10_000  # basis points
+
+    lower = mid * (1 - pct_window / 100.0)
+    upper = mid * (1 + pct_window / 100.0)
+
+    bids_vol = 0.0
+    for p, q in bids:
+        price = float(p)
+        qty = float(q)
+        if price >= lower:
+            bids_vol += qty
+        else:
+            break  # بقية العروض أبعد من النافذة
+
+    asks_vol = 0.0
+    for p, q in asks:
+        price = float(p)
+        qty = float(q)
+        if price <= upper:
+            asks_vol += qty
+        else:
+            break
+
+    total = bids_vol + asks_vol
+    if total <= 0:
+        buy_pct = sell_pct = 0.0
+        imbalance = 0.0
+    else:
+        buy_pct = (bids_vol / total) * 100.0
+        sell_pct = (asks_vol / total) * 100.0
+        imbalance = (bids_vol - asks_vol) / total
+
+    return PairStats(
+        symbol=symbol,
+        mid_price=mid,
+        spread_bps=spread_bps,
+        bids_vol=bids_vol,
+        asks_vol=asks_vol,
+        buy_pct=buy_pct,
+        sell_pct=sell_pct,
+        imbalance=imbalance,
+        last_update=time.time(),
+    )
+
+
+def build_table(stats_list: List[PairStats], pct_window: float) -> Table:
+    table = Table(
+        title=f"📊 Binance Order Book Monitor  ±{pct_window:.2f}% Window",
+        box=box.ROUNDED,
+        expand=True,
+        show_lines=False,
+        title_style="bold cyan",
+    )
+    table.add_column("#", justify="right", style="bold dim")
+    table.add_column("Symbol", style="bold white")
+    table.add_column("Price", justify="right")
+    table.add_column("Spread (bps)", justify="right")
+    table.add_column("Bids Vol", justify="right", style="green")
+    table.add_column("Asks Vol", justify="right", style="red")
+    table.add_column("Buy%", justify="right", style="bold green")
+    table.add_column("Sell%", justify="right", style="bold red")
+    table.add_column("Imbalance", justify="right")
+    table.add_column("Updated", justify="right", style="dim")
+
+    # ترتيب حسب أعلى Imbalance لصالح الشراء
+    stats_sorted = sorted(stats_list, key=lambda s: s.imbalance, reverse=True)
+
+    now = time.time()
+    for i, s in enumerate(stats_sorted, 1):
+        age = now - s.last_update
+        age_s = f"{age:.1f}s"
+
+        imb_color = "green" if s.imbalance > 0 else ("red" if s.imbalance < 0 else "yellow")
+        imb_txt = f"[bold {imb_color}]{s.imbalance:+.2%}[/]"
+
+        table.add_row(
+            str(i),
+            s.symbol,
+            human(s.mid_price),
+            f"{s.spread_bps:.1f}",
+            human(s.bids_vol),
+            human(s.asks_vol),
+            f"{s.buy_pct:5.1f}%",
+            f"{s.sell_pct:5.1f}%",
+            imb_txt,
+            age_s,
+        )
+    return table
+
+
+async def gather_stats(session: aiohttp.ClientSession, symbols: List[str], pct_window: float) -> List[PairStats]:
+    tasks = [fetch_depth(session, sym) for sym in symbols]
+    depths = await asyncio.gather(*tasks, return_exceptions=True)
+    stats: List[PairStats] = []
+    for sym, d in zip(symbols, depths):
+        if isinstance(d, Exception):
+            console.print(f"[red]فشل جلب {sym}: {d}")
+            continue
+        try:
+            s = calc_stats(sym, d, pct_window)
+            stats.append(s)
+        except Exception as e:
+            console.print(f"[red]خطأ حساب {sym}: {e}")
+    return stats
+
+
+async def main():
+    console.print("[bold cyan]Binance Order Book Monitor[/]")
+    api_key = input("Enter Binance API Key (اختياري): ")
+    # مبدئيًا غير مستخدم لأننا نستخدم نهايات عامة
+    from getpass import getpass
+    _ = getpass("Enter Binance API Secret (اختياري): ")
+
+    pct_str = input("أدخل نسبة النافذة حول السعر % (مثال 0.5): ") or "0.5"
+    try:
+        pct_window = float(pct_str)
+    except ValueError:
+        pct_window = 0.5
+
+    interval_str = input("فترة التحديث بالثواني (افتراضي 3): ") or "3"
+    try:
+        refresh_sec = max(1, int(float(interval_str)))
+    except ValueError:
+        refresh_sec = 3
+
+    symbols_input = input(
+        "أدخل الرموز مفصولة بفواصل (Enter لاستخدام الافتراضي 10): "
+    ).strip()
+    symbols = (
+        [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+        if symbols_input
+        else DEFAULT_SYMBOLS
+    )
+
+    headers = {"X-MBX-APIKEY": api_key} if api_key else {}
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        with Live(console=console, auto_refresh=False, screen=False) as live:
+            while True:
+                try:
+                    stats = await gather_stats(session, symbols, pct_window)
+                    table = build_table(stats, pct_window)
+                    live.update(table, refresh=True)
+                except Exception as e:
+                    console.print(f"[red]حدث خطأ عام: {e}")
+                await asyncio.sleep(refresh_sec)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nخروج…")
